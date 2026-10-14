@@ -1,9 +1,12 @@
-import ccxt, sys
+import ccxt, sys, os, requests
 from datetime import datetime, timezone
 import pandas as pd, numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 
-SYMS = ["XLM/USDT","BTC/USDT","ETH/USDT","SOL/USDT","BNB/USDT"]
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
+TG_CHAT_ID   = os.getenv("TG_CHAT_ID")
+
+SYMS = ["XLM/USDT","BTC/USDT","XRP/USDT","TRX/USDT","ADA/USDT"]
 TF = "1h"; DAYS = 30
 SW_LEFT=5; SW_RIGHT=5; ATR_LEN=14; MAX_ZONES=5
 MIN_FVG_MULT=0.5; MAX_OB_DIST=15
@@ -11,6 +14,21 @@ ENTRY_ATR=1.2; SL_BUF_ATR=0.15; TP_ATR_FALLBACK=2.5
 
 ex = ccxt.mexc({"enableRateLimit": True, "timeout": 30000})
 ex.load_markets()
+
+LINES = []
+def log(s):
+    print(s); LINES.append(str(s))
+
+def send_tg(text):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        log("(telegram skipped: creds missing)"); return
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": text[:3900]}, timeout=15)
+        log(f"(telegram status: {r.status_code})")
+    except Exception as e:
+        log(f"(telegram error: {type(e).__name__})")
 
 def fetch(sym):
     since = ex.milliseconds() - DAYS*86400000
@@ -105,21 +123,22 @@ def analyze(df):
     last=[e for e in entries if e["bar"]==n-1]
     return (last[0] if last else None), diag
 
-print("STRATEGY PROBE |", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
+log("STRATEGY PROBE | "+datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
 any_sig=False
 for s in SYMS:
     try:
         df=fetch(s); sig,diag=analyze(df)
     except Exception as e:
-        print(f"{s}: ERROR {type(e).__name__} {str(e)[:120]}"); continue
+        log(f"{s}: ERROR {type(e).__name__} {str(e)[:120]}"); continue
     if "reason" in diag:
-        print(f"{s}: SKIP {diag['reason']} (n={diag.get('n')})"); continue
+        log(f"{s}: SKIP {diag['reason']} (n={diag.get('n')})"); continue
     tr={1:"UP",-1:"DN",0:"FLAT"}[diag["trend"]]
     if sig:
         any_sig=True
         side="LONG" if sig["dir"]==1 else "SHORT"
-        print(f"{s}: SIGNAL {side} @ {sig['entry']:.6f} SL {sig['sl']:.6f} TP {sig['tp']:.6f} | trend={tr} zones={sig['nOB']}OB+{sig['nFV']}FVG")
+        log(f"{s}: >>> SIGNAL {side} @ {sig['entry']:.6f} | SL {sig['sl']:.6f} | TP {sig['tp']:.6f} | trend={tr} zones={sig['nOB']}OB+{sig['nFV']}FVG")
     else:
         co="chochUp" if diag["chochUp"] else ("chochDn" if diag["chochDn"] else "no-ChoCH")
-        print(f"{s}: no-signal | trend={tr} {co} bullZ={diag['bull']} bearZ={diag['bear']} price={diag['price']:.6f}")
-print("VERDICT:", "OK - decision engine alive" if any_sig else "OK-but-quiet - engine works, no setup on last closed bar (normal)")
+        log(f"{s}: no-signal | trend={tr} {co} bullZ={diag['bull']} bearZ={diag['bear']} price={diag['price']:.6f}")
+log("VERDICT: " + ("OK - decision engine alive, signal(s) above" if any_sig else "OK-but-quiet - engine works, no setup on last closed bar (normal)"))
+send_tg("\n".join(LINES))
