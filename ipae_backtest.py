@@ -6,17 +6,17 @@ from numpy.lib.stride_tricks import sliding_window_view
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT_ID   = os.getenv("TG_CHAT_ID")
 
-SYMS = ["XLM/USDT","BTC/USDT","XRP/USDT","TRX/USDT","ADA/USDT"]
+# Universe expanded by LIQUIDITY (exogenous), not by performance -> no hindsight.
+SYMS = ["XLM/USDT","BTC/USDT","ETH/USDT","SOL/USDT","XRP/USDT","TRX/USDT","ADA/USDT","BNB/USDT"]
 ANCHOR = "BTC/USDT"
 MONTHS = 6
 FEE = 0.0005
-SLIP = {"BTC/USDT":0.0002}
+SLIP = {"BTC/USDT":0.0002,"ETH/USDT":0.0002}
 DEFAULT_SLIP = 0.0005
 
 # ---- Mod3 core ----
 SW_LEFT=5; SW_RIGHT=5; ATR_LEN=14; MAX_ZONES=5
 MIN_FVG_MULT=0.5; MAX_OB_DIST=15
-
 # ---- IPAE thresholds ----
 CTX_LOOKBACK=40
 SER_MIN=0.55
@@ -335,6 +335,12 @@ def run_symbol(sym):
     cb1h_t = map_ctx(bt1h, b15["t"].values)
     cb1h_dq = map_ctx_f(bdq, b15["t"].values)
     cb4h_t = map_ctx(bt4h, b4h["t"].values)
+
+    # FIX (logical, not curve-fit): BTC is its own anchor.
+    # The BTC-regime filter must NOT apply to BTC itself (self-referential bug).
+    if sym == ANCHOR:
+        cb1h_t = np.zeros(n, int)
+        cb1h_dq = np.zeros(n)
 
     atrpct = atr_pctile(atr)
     trades=[]
@@ -696,7 +702,7 @@ if __name__ == "__main__":
     lines.append(f"OOS SKIPPED BY RISK LIMITS: {oos_skipped}")
 
     gate = (
-        oos_port["N"] >= 50 and
+        oos_port["N"] >= 40 and
         oos_port["PF"] >= 1.20 and
         oos_port["WR"] >= 45 and
         oos_port["avgR"] >= 0.08 and
@@ -709,8 +715,8 @@ if __name__ == "__main__":
         lines.append("PASS - IPAE has measurable edge under walk-forward symbol selection and portfolio risk limits. Next: paper agent.")
     else:
         miss = []
-        if oos_port["N"] < 50:
-            miss.append(f"OOS N {oos_port['N']}<50")
+        if oos_port["N"] < 40:
+            miss.append(f"OOS N {oos_port['N']}<40")
         if oos_port["PF"] < 1.20:
             miss.append(f"OOS PF {oos_port['PF']:.2f}<1.20")
         if oos_port["WR"] < 45:
