@@ -1,0 +1,17 @@
+name: IPAE Backtest
+on:
+  workflow_dispatch:
+jobs:
+  ipae:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: pip install ccxt pandas numpy requests
+      - run: python ipae_backtest.py
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
