@@ -17,6 +17,7 @@ DEFAULT_SLIP = 0.0005
 # ---- Mod3 core ----
 SW_LEFT=5; SW_RIGHT=5; ATR_LEN=14; MAX_ZONES=5
 MIN_FVG_MULT=0.5; MAX_OB_DIST=15
+
 # ---- IPAE-lite thresholds ----
 CTX_LOOKBACK=40
 DQ_MIN=0.70; DQ_STRONG=1.00
@@ -25,6 +26,14 @@ RR_HOMU=1.8; RR_COUNTER=2.5
 SCORE_MIN=55; SCORE_COUNTER=65   # lowered because fewer factors remain
 SWEEP_MIN_ATR=0.10
 MAX_HOLD=96
+
+# ---- Risk layer ----
+# This is the only change vs prior run: lower position size to control DD.
+RISK_PCT = 0.0075
+MAX_CONCURRENT = 1
+DAILY_STOP_R = -1.5
+WEEKLY_STOP_R = -3.0
+COOLDOWN_HOURS = 24
 
 ex = ccxt.mexc({"enableRateLimit": True, "timeout": 30000})
 try:
@@ -310,112 +319,225 @@ def run_symbol(sym):
         allowed=j
     return trades
 
-def stats(trades):
-    if not trades: return dict(N=0,WR=0.0,PF=0.0,avgR=0.0,DD=0.0)
-    R=np.array([x["R"] for x in trades]); tot=len(R)
+def stats(trades, risk_pct=None):
+    if not trades:
+        return dict(N=0, WR=0.0, PF=0.0, avgR=0.0, DD=0.0)
+    if risk_pct is None:
+        risk_pct = RISK_PCT
+    R=np.array([x["R"] for x in trades])
+    tot=len(R)
     wr=float((R>0).sum())/tot*100
-    gp=float(R[R>0].sum()); gl=float(abs(R[R<=0].sum()))
+    gp=float(R[R>0].sum())
+    gl=float(abs(R[R<=0].sum()))
     pf=gp/gl if gl>0 else 99.0
-    eq=np.cumprod(1+R*0.01); pk=np.maximum.accumulate(eq)
+    eq=np.cumprod(1+R*risk_pct)
+    pk=np.maximum.accumulate(eq)
     dd=float(((pk-eq)/pk).max()*100) if len(eq) else 0.0
-    return dict(N=tot,WR=wr,PF=min(pf,99.0),avgR=float(R.mean()),DD=dd)
+    return dict(N=tot, WR=wr, PF=min(pf,99.0), avgR=float(R.mean()), DD=dd)
 
 def time_chunks(trades,n_chunks=3):
-    if not trades: return [[] for _ in range(n_chunks)]
-    t0=min(x["entry_time"] for x in trades); t1=max(x["entry_time"] for x in trades)
+    if not trades:
+        return [[] for _ in range(n_chunks)]
+    t0=min(x["entry_time"] for x in trades)
+    t1=max(x["entry_time"] for x in trades)
     if t1<=t0:
-        ch=[[] for _ in range(n_chunks)]; ch[0]=trades[:]; return ch
-    step=(t1-t0)/float(n_chunks); ch=[[] for _ in range(n_chunks)]
+        ch=[[] for _ in range(n_chunks)]
+        ch[0]=trades[:]
+        return ch
+    step=(t1-t0)/float(n_chunks)
+    ch=[[] for _ in range(n_chunks)]
     for x in trades:
         i=int((x["entry_time"]-t0)//step) if step>0 else 0
-        i=max(0,min(n_chunks-1,i)); ch[i].append(x)
+        i=max(0,min(n_chunks-1,i))
+        ch[i].append(x)
     return ch
 
 def walkforward(trades):
-    if not trades: return 0,[]
-    ch=time_chunks(trades,3); pc=0; det=[]
+    if not trades:
+        return 0,[]
+    ch=time_chunks(trades,3)
+    pc=0
+    det=[]
     for i,c in enumerate(ch):
-        s=stats(c); ok=s["N"]>=8 and s["PF"]>=1.0
-        if ok: pc+=1
+        s=stats(c)
+        ok=s["N"]>=8 and s["PF"]>=1.0
+        if ok:
+            pc+=1
         det.append(f"C{i+1}:N{s['N']} PF{s['PF']:.2f}")
     return pc,det
 
-def portfolio_stats(trades,max_concurrent=1,daily_stop_R=-1.5,weekly_stop_R=-3.0,risk_pct=0.01,cooldown_hours=24):
-    if not trades: return dict(N=0,WR=0.0,PF=0.0,avgR=0.0,DD=0.0),[]
-    cand=sorted(trades,key=lambda x:x["entry_time"]); heap=[]; accepted=[]
-    equity=1.0; peak=1.0; dd=0.0
-    cur_d=None; cur_w=None; daily_R=0.0; weekly_R=0.0; d_blk=False; w_blk=False
-    last_exit={}; cd_ms=cooldown_hours*3600000
-    def date_of(ms): return datetime.fromtimestamp(ms/1000,tz=timezone.utc).strftime("%Y-%m-%d")
+def portfolio_stats(
+    trades,
+    max_concurrent=MAX_CONCURRENT,
+    daily_stop_R=DAILY_STOP_R,
+    weekly_stop_R=WEEKLY_STOP_R,
+    risk_pct=RISK_PCT,
+    cooldown_hours=COOLDOWN_HOURS
+):
+    if not trades:
+        return dict(N=0, WR=0.0, PF=0.0, avgR=0.0, DD=0.0), []
+
+    cand=sorted(trades,key=lambda x:x["entry_time"])
+    heap=[]
+    accepted=[]
+
+    equity=1.0
+    peak=1.0
+    dd=0.0
+
+    cur_d=None
+    cur_w=None
+    daily_R=0.0
+    weekly_R=0.0
+    d_blk=False
+    w_blk=False
+
+    last_exit={}
+    cd_ms=cooldown_hours*3600000
+
+    def date_of(ms):
+        return datetime.fromtimestamp(ms/1000,tz=timezone.utc).strftime("%Y-%m-%d")
+
     def week_of(ms):
-        dt=datetime.fromtimestamp(ms/1000,tz=timezone.utc); iso=dt.isocalendar()
+        dt=datetime.fromtimestamp(ms/1000,tz=timezone.utc)
+        iso=dt.isocalendar()
         return f"{iso.year}-{iso.week}"
+
     i=0
     while i<len(cand) or heap:
-        ne=cand[i]["entry_time"] if i<len(cand) else float("inf")
-        nx=heap[0][0] if heap else float("inf")
-        if nx<=ne:
+        next_entry = cand[i]["entry_time"] if i < len(cand) else float("inf")
+        next_exit  = heap[0][0] if heap else float("inf")
+
+        if next_exit <= next_entry:
             xt,R,sym=heapq.heappop(heap)
-            d=date_of(xt); w=week_of(xt)
-            if d!=cur_d: cur_d=d; daily_R=0.0; d_blk=False
-            if w!=cur_w: cur_w=w; weekly_R=0.0; w_blk=False
-            equity*=(1.0+R*risk_pct)
-            if equity>peak: peak=equity
-            cur_dd=((peak-equity)/peak*100.0) if peak>0 else 0.0
-            if cur_dd>dd: dd=cur_dd
-            daily_R+=R; weekly_R+=R; last_exit[sym]=xt
-            if daily_R<=daily_stop_R: d_blk=True
-            if weekly_R<=weekly_stop_R: w_blk=True
+            d=date_of(xt)
+            w=week_of(xt)
+
+            if d != cur_d:
+                cur_d=d
+                daily_R=0.0
+                d_blk=False
+            if w != cur_w:
+                cur_w=w
+                weekly_R=0.0
+                w_blk=False
+
+            equity *= (1.0 + R * risk_pct)
+            if equity > peak:
+                peak = equity
+            cur_dd = ((peak - equity) / peak * 100.0) if peak > 0 else 0.0
+            if cur_dd > dd:
+                dd = cur_dd
+
+            daily_R += R
+            weekly_R += R
+            last_exit[sym] = xt
+
+            if daily_R <= daily_stop_R:
+                d_blk = True
+            if weekly_R <= weekly_stop_R:
+                w_blk = True
         else:
-            tr=cand[i]; i+=1
-            et=tr["entry_time"]; d=date_of(et); w=week_of(et)
-            if d!=cur_d: cur_d=d; daily_R=0.0; d_blk=False
-            if w!=cur_w: cur_w=w; weekly_R=0.0; w_blk=False
-            if d_blk or w_blk: continue
-            if len(heap)>=max_concurrent: continue
-            le=last_exit.get(tr["sym"],-1e18)
-            if et-le<cd_ms: continue
-            heapq.heappush(heap,(tr["exit_time"],tr["R"],tr["sym"]))
+            tr=cand[i]
+            i += 1
+            et=tr["entry_time"]
+            d=date_of(et)
+            w=week_of(et)
+
+            if d != cur_d:
+                cur_d=d
+                daily_R=0.0
+                d_blk=False
+            if w != cur_w:
+                cur_w=w
+                weekly_R=0.0
+                w_blk=False
+
+            if d_blk or w_blk:
+                continue
+            if len(heap) >= max_concurrent:
+                continue
+
+            le=last_exit.get(tr["sym"], -1e18)
+            if et - le < cd_ms:
+                continue
+
+            heapq.heappush(heap, (tr["exit_time"], tr["R"], tr["sym"]))
             accepted.append(tr)
-    s=stats(accepted); s["DD"]=dd
-    return s,accepted
+
+    s=stats(accepted, risk_pct=risk_pct)
+    s["DD"]=dd
+    return s, accepted
 
 def send(text):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID: print("(no tg)"); return
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        print("(no tg)")
+        return
     try:
-        r=requests.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-                        json={"chat_id":TG_CHAT_ID,"text":str(text)[:3900]},timeout=15)
-        print("tg:",r.status_code)
-    except Exception as e: print("tg err",type(e).__name__)
+        r=requests.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+            json={"chat_id":TG_CHAT_ID,"text":str(text)[:3900]},
+            timeout=15
+        )
+        print("tg:", r.status_code)
+    except Exception as e:
+        print("tg err", type(e).__name__)
 
-if __name__=="__main__":
-    print("IPAE-LITE start",datetime.now(timezone.utc).isoformat())
-    all_tr=[]; lines=[f"IPAE-LITE | {MONTHS}mo | {SYMS[0]} | fees+slip incl."]
+if __name__ == "__main__":
+    print("IPAE-LITE start", datetime.now(timezone.utc).isoformat())
+    all_tr=[]
+    lines=[f"IPAE-LITE | {MONTHS}mo | {SYMS[0]} | fees+slip incl. | risk={RISK_PCT*100:.2f}%"]
+
     for sym in SYMS:
-        tr=run_symbol(sym); s=stats(tr)
-        lines.append(f"{sym}: N={s['N']} WR={s['WR']:.0f} PF={s['PF']:.2f} aR={s['avgR']:+.2f} DD={s['DD']:.1f}")
-        all_tr+=tr
+        tr=run_symbol(sym)
+        s=stats(tr, risk_pct=0.01)
+        lines.append(f"{sym} @1%: N={s['N']} WR={s['WR']:.0f} PF={s['PF']:.2f} aR={s['avgR']:+.2f} DD={s['DD']:.1f}")
+        all_tr += tr
+
     all_tr.sort(key=lambda x:x["entry_time"])
-    raw=stats(all_tr)
-    port,acc=portfolio_stats(all_tr,max_concurrent=1,daily_stop_R=-1.5,weekly_stop_R=-3.0,risk_pct=0.01,cooldown_hours=24)
+
+    raw=stats(all_tr, risk_pct=0.01)
+    port,acc=portfolio_stats(all_tr)
     skipped=len(all_tr)-len(acc)
     pc,det=walkforward(acc)
+
     lines.append("")
-    lines.append(f"RAW: N={raw['N']} WR={raw['WR']:.1f} PF={raw['PF']:.2f} aR={raw['avgR']:+.3f} DD={raw['DD']:.1f}")
-    lines.append(f"PORTFOLIO max1 d-1.5 w-3 cd24: N={port['N']} WR={port['WR']:.1f} PF={port['PF']:.2f} aR={port['avgR']:+.3f} DD={port['DD']:.1f} WF={pc}/3 [{', '.join(det)}]")
+    lines.append(f"RAW @1%: N={raw['N']} WR={raw['WR']:.1f} PF={raw['PF']:.2f} aR={raw['avgR']:+.3f} DD={raw['DD']:.1f}")
+    lines.append(
+        f"PORTFOLIO max{MAX_CONCURRENT} daily{DAILY_STOP_R} weekly{WEEKLY_STOP_R} cd{COOLDOWN_HOURS}h risk{RISK_PCT*100:.2f}%: "
+        f"N={port['N']} WR={port['WR']:.1f} PF={port['PF']:.2f} aR={port['avgR']:+.3f} DD={port['DD']:.1f} WF={pc}/3 [{', '.join(det)}]"
+    )
     lines.append(f"SKIPPED: {skipped}")
-    gate=(port['N']>=30 and port['PF']>=1.20 and port['WR']>=45 and port['avgR']>=0.08 and port['DD']<=12 and pc>=2)
+
+    gate = (
+        port["N"] >= 30 and
+        port["PF"] >= 1.20 and
+        port["WR"] >= 45 and
+        port["avgR"] >= 0.08 and
+        port["DD"] <= 12 and
+        pc >= 2
+    )
+
     lines.append("")
     if gate:
-        lines.append("PASS - XRP IPAE-lite has measurable edge. Next: paper agent.")
+        lines.append("PASS - XRP IPAE-lite has measurable edge under 0.75% risk. Next: paper agent.")
     else:
         miss=[]
-        if port['N']<30: miss.append(f"N {port['N']}<30")
-        if port['PF']<1.20: miss.append(f"PF {port['PF']:.2f}<1.20")
-        if port['WR']<45: miss.append(f"WR {port['WR']:.1f}<45")
-        if port['avgR']<0.08: miss.append(f"aR {port['avgR']:+.3f}<0.08")
-        if port['DD']>12: miss.append(f"DD {port['DD']:.1f}>12")
-        if pc<2: miss.append(f"WF {pc}<2")
-        lines.append("FAIL - "+", ".join(miss)+". Do NOT go live.")
+        if port["N"] < 30:
+            miss.append(f"N {port['N']}<30")
+        if port["PF"] < 1.20:
+            miss.append(f"PF {port['PF']:.2f}<1.20")
+        if port["WR"] < 45:
+            miss.append(f"WR {port['WR']:.1f}<45")
+        if port["avgR"] < 0.08:
+            miss.append(f"aR {port['avgR']:+.3f}<0.08")
+        if port["DD"] > 12:
+            miss.append(f"DD {port['DD']:.1f}>12")
+        if pc < 2:
+            miss.append(f"WF {pc}<2")
+        lines.append("FAIL - " + ", ".join(miss) + ". Do NOT go live.")
+
     out="\n".join(lines)
-    print(out); send(out); print("DONE")
+    print(out)
+    send(out)
+    print("DONE")
