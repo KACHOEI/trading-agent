@@ -1,5 +1,13 @@
 {
-  "open": {},
+  "open": {
+    "XRP/USDT": {
+      "dir": 1,
+      "entry": 1.3237,
+      "sl": 1.321424642857143,
+      "tp": 1.3296835714285713,
+      "entry_time": 1792749600000.0
+    }
+  },
   "history": [],
   "last_exit": {},
   "last_heartbeat": "2026-10-23"
